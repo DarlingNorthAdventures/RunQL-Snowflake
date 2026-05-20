@@ -3,16 +3,26 @@ import {
   ConnectionProfile,
   ConnectionSecrets,
   DbAdapter,
+  ForeignKeyModel,
   NonQueryResult,
   QueryResult,
   QueryRunOptions,
   RoutineModel,
   SchemaIntrospection,
-  SchemaModel
+  SchemaModel,
+  TableModel
 } from './types';
 
 const CONNECTION_TIMEOUT_MS = 30000;
 const SNOWFLAKE_DOMAIN_SUFFIX = '.snowflakecomputing.com';
+
+interface SnowflakeSchemaEntry {
+  name: string;
+  tables: Map<string, TableModel>;
+  views: Map<string, TableModel>;
+  procedures: RoutineModel[];
+  functions: RoutineModel[];
+}
 
 export class SnowflakeAdapter implements DbAdapter {
   readonly dialect = 'snowflake';
@@ -80,8 +90,6 @@ export class SnowflakeAdapter implements DbAdapter {
     try {
       await this.connect(conn);
 
-      const schemaFilter = profile.schema?.trim();
-
       const targetDatabase = await this.getCurrentDatabase(conn);
       if (!targetDatabase) {
         throw new Error(
@@ -90,19 +98,52 @@ export class SnowflakeAdapter implements DbAdapter {
         );
       }
 
-      const [columnRows, routineRows, parameterRows] = await Promise.all([
-        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase, schemaFilter)),
-        this.execute(conn, this.buildRoutinesIntrospectionSql(targetDatabase, schemaFilter)),
-        this.execute(conn, this.buildRoutineParametersSql(targetDatabase, schemaFilter))
+      const [schemaRows, tableRows, columnRows, primaryKeyRows, foreignKeyRows, routineRows, parameterRows] = await Promise.all([
+        this.execute(conn, this.buildSchemasIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildTablesIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildPrimaryKeysIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildForeignKeysIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildRoutinesIntrospectionSql(targetDatabase)),
+        this.execute(conn, this.buildRoutineParametersSql(targetDatabase))
       ]);
 
-      const schemasMap = new Map<string, {
-        name: string;
-        tables: Map<string, any>;
-        procedures: RoutineModel[];
-        functions: RoutineModel[];
-      }>();
+      const schemasMap = new Map<string, SnowflakeSchemaEntry>();
+      const tableTypeMap = new Map<string, string>();
+      const tableCommentMap = new Map<string, string | undefined>();
       const routinesBySpecificName = new Map<string, RoutineModel>();
+
+      for (const row of schemaRows) {
+        const schemaName = this.getRowString(row, ['SCHEMA_NAME', 'schema_name']);
+        if (schemaName) {
+          this.ensureSchema(schemasMap, schemaName);
+        }
+      }
+
+      for (const row of tableRows) {
+        const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
+        const tableName = this.getRowString(row, ['TABLE_NAME', 'table_name']);
+        const tableType = this.getRowString(row, ['TABLE_TYPE', 'table_type']) || 'BASE TABLE';
+        const tableComment = this.getRowString(row, ['COMMENT', 'comment']);
+        if (!schemaName || !tableName) {
+          continue;
+        }
+
+        const tableKey = this.objectKey(schemaName, tableName);
+        tableTypeMap.set(tableKey, tableType);
+        tableCommentMap.set(tableKey, tableComment);
+
+        const schema = this.ensureSchema(schemasMap, schemaName);
+        const targetMap = this.isViewType(tableType) ? schema.views : schema.tables;
+        if (!targetMap.has(tableName)) {
+          targetMap.set(tableName, {
+            name: tableName,
+            comment: tableComment || undefined,
+            columns: [],
+            foreignKeys: []
+          });
+        }
+      }
 
       for (const row of columnRows) {
         const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
@@ -116,19 +157,20 @@ export class SnowflakeAdapter implements DbAdapter {
           continue;
         }
 
-        if (!schemasMap.has(schemaName)) {
-          schemasMap.set(schemaName, { name: schemaName, tables: new Map(), procedures: [], functions: [] });
-        }
-        const schema = schemasMap.get(schemaName)!;
+        const schema = this.ensureSchema(schemasMap, schemaName);
+        const tableKey = this.objectKey(schemaName, tableName);
+        const tableType = tableTypeMap.get(tableKey) || 'BASE TABLE';
+        const targetMap = this.isViewType(tableType) ? schema.views : schema.tables;
 
-        if (!schema.tables.has(tableName)) {
-          schema.tables.set(tableName, {
+        if (!targetMap.has(tableName)) {
+          targetMap.set(tableName, {
             name: tableName,
+            comment: tableCommentMap.get(tableKey),
             columns: [],
             foreignKeys: []
           });
         }
-        const table = schema.tables.get(tableName)!;
+        const table = targetMap.get(tableName)!;
 
         table.columns.push({
           name: columnName,
@@ -136,6 +178,49 @@ export class SnowflakeAdapter implements DbAdapter {
           nullable: nullableRaw.toUpperCase() === 'YES',
           comment: columnComment || undefined
         });
+      }
+
+      for (const row of primaryKeyRows) {
+        const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
+        const tableName = this.getRowString(row, ['TABLE_NAME', 'table_name']);
+        const columnName = this.getRowString(row, ['COLUMN_NAME', 'column_name']);
+        if (!schemaName || !tableName || !columnName) {
+          continue;
+        }
+
+        const table = schemasMap.get(schemaName)?.tables.get(tableName);
+        if (!table) {
+          continue;
+        }
+        table.primaryKey = table.primaryKey ?? [];
+        table.primaryKey.push(columnName);
+      }
+
+      for (const row of foreignKeyRows) {
+        const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
+        const tableName = this.getRowString(row, ['TABLE_NAME', 'table_name']);
+        const columnName = this.getRowString(row, ['COLUMN_NAME', 'column_name']);
+        const foreignSchema = this.getRowString(row, ['FOREIGN_SCHEMA', 'foreign_schema']);
+        const foreignTable = this.getRowString(row, ['FOREIGN_TABLE', 'foreign_table']);
+        const foreignColumn = this.getRowString(row, ['FOREIGN_COLUMN', 'foreign_column']);
+        if (!schemaName || !tableName || !columnName || !foreignSchema || !foreignTable || !foreignColumn) {
+          continue;
+        }
+
+        const table = schemasMap.get(schemaName)?.tables.get(tableName);
+        if (!table) {
+          continue;
+        }
+
+        const foreignKey: ForeignKeyModel = {
+          name: this.getRowString(row, ['CONSTRAINT_NAME', 'constraint_name']),
+          column: columnName,
+          foreignSchema,
+          foreignTable,
+          foreignColumn
+        };
+        table.foreignKeys = table.foreignKeys ?? [];
+        table.foreignKeys.push(foreignKey);
       }
 
       for (const row of routineRows) {
@@ -149,10 +234,7 @@ export class SnowflakeAdapter implements DbAdapter {
           continue;
         }
 
-        if (!schemasMap.has(schemaName)) {
-          schemasMap.set(schemaName, { name: schemaName, tables: new Map(), procedures: [], functions: [] });
-        }
-        const schema = schemasMap.get(schemaName)!;
+        const schema = this.ensureSchema(schemasMap, schemaName);
 
         const kind = routineTypeRaw.toUpperCase() === 'PROCEDURE' ? 'procedure' : 'function';
         const routine: RoutineModel = {
@@ -226,7 +308,8 @@ export class SnowflakeAdapter implements DbAdapter {
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((schema) => ({
           name: schema.name,
-          tables: Array.from(schema.tables.values()).sort((a: any, b: any) => a.name.localeCompare(b.name)),
+          tables: Array.from(schema.tables.values()).sort((a, b) => a.name.localeCompare(b.name)),
+          views: Array.from(schema.views.values()).sort((a, b) => a.name.localeCompare(b.name)),
           procedures: schema.procedures,
           functions: schema.functions
         }));
@@ -256,9 +339,33 @@ export class SnowflakeAdapter implements DbAdapter {
     }
   }
 
-  private buildColumnsIntrospectionSql(databaseName: string, schemaFilter?: string): string {
+  private buildSchemasIntrospectionSql(databaseName: string): string {
     const db = this.quoteIdentifier(databaseName);
-    let sql = `
+    return `
+      SELECT SCHEMA_NAME
+      FROM ${db}.INFORMATION_SCHEMA.SCHEMATA
+      WHERE SCHEMA_NAME NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY SCHEMA_NAME
+    `;
+  }
+
+  private buildTablesIntrospectionSql(databaseName: string): string {
+    const db = this.quoteIdentifier(databaseName);
+    return `
+      SELECT
+        TABLE_SCHEMA,
+        TABLE_NAME,
+        TABLE_TYPE,
+        COMMENT
+      FROM ${db}.INFORMATION_SCHEMA.TABLES
+      WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY TABLE_SCHEMA, TABLE_NAME
+    `;
+  }
+
+  private buildColumnsIntrospectionSql(databaseName: string): string {
+    const db = this.quoteIdentifier(databaseName);
+    return `
       SELECT
         TABLE_CATALOG,
         TABLE_SCHEMA,
@@ -269,20 +376,62 @@ export class SnowflakeAdapter implements DbAdapter {
         COMMENT
       FROM ${db}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
     `;
-
-    if (schemaFilter) {
-      const escapedSchema = schemaFilter.toUpperCase().replace(/'/g, "''");
-      sql += ` AND TABLE_SCHEMA = '${escapedSchema}'`;
-    }
-
-    sql += ' ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION';
-    return sql;
   }
 
-  private buildRoutinesIntrospectionSql(databaseName: string, schemaFilter?: string): string {
+  private buildPrimaryKeysIntrospectionSql(databaseName: string): string {
     const db = this.quoteIdentifier(databaseName);
-    let sql = `
+    return `
+      SELECT
+        kcu.TABLE_SCHEMA,
+        kcu.TABLE_NAME,
+        kcu.COLUMN_NAME
+      FROM ${db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        ON kcu.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
+       AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+       AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+      WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+        AND kcu.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION
+    `;
+  }
+
+  private buildForeignKeysIntrospectionSql(databaseName: string): string {
+    const db = this.quoteIdentifier(databaseName);
+    return `
+      SELECT
+        fk.TABLE_SCHEMA,
+        fk.TABLE_NAME,
+        fk.COLUMN_NAME,
+        tc.CONSTRAINT_NAME,
+        pk.TABLE_SCHEMA AS FOREIGN_SCHEMA,
+        pk.TABLE_NAME AS FOREIGN_TABLE,
+        pk.COLUMN_NAME AS FOREIGN_COLUMN
+      FROM ${db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
+        ON fk.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
+       AND fk.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+       AND fk.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+      JOIN ${db}.INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+        ON rc.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
+       AND rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+       AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk
+        ON pk.CONSTRAINT_CATALOG = rc.UNIQUE_CONSTRAINT_CATALOG
+       AND pk.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA
+       AND pk.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME
+       AND pk.ORDINAL_POSITION = fk.POSITION_IN_UNIQUE_CONSTRAINT
+      WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+        AND fk.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY fk.TABLE_SCHEMA, fk.TABLE_NAME, tc.CONSTRAINT_NAME, fk.ORDINAL_POSITION
+    `;
+  }
+
+  private buildRoutinesIntrospectionSql(databaseName: string): string {
+    const db = this.quoteIdentifier(databaseName);
+    return `
       SELECT
         ROUTINE_SCHEMA,
         ROUTINE_NAME,
@@ -290,21 +439,14 @@ export class SnowflakeAdapter implements DbAdapter {
         ROUTINE_TYPE,
         DATA_TYPE
       FROM ${db}.INFORMATION_SCHEMA.ROUTINES
-      WHERE ROUTINE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+      WHERE ROUTINE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME
     `;
-
-    if (schemaFilter) {
-      const escapedSchema = schemaFilter.toUpperCase().replace(/'/g, "''");
-      sql += ` AND ROUTINE_SCHEMA = '${escapedSchema}'`;
-    }
-
-    sql += ' ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME';
-    return sql;
   }
 
-  private buildRoutineParametersSql(databaseName: string, schemaFilter?: string): string {
+  private buildRoutineParametersSql(databaseName: string): string {
     const db = this.quoteIdentifier(databaseName);
-    let sql = `
+    return `
       SELECT
         SPECIFIC_SCHEMA,
         SPECIFIC_NAME,
@@ -313,16 +455,30 @@ export class SnowflakeAdapter implements DbAdapter {
         DATA_TYPE,
         ORDINAL_POSITION
       FROM ${db}.INFORMATION_SCHEMA.PARAMETERS
-      WHERE SPECIFIC_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+      WHERE SPECIFIC_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ORDER BY SPECIFIC_SCHEMA, SPECIFIC_NAME, ORDINAL_POSITION
     `;
+  }
 
-    if (schemaFilter) {
-      const escapedSchema = schemaFilter.toUpperCase().replace(/'/g, "''");
-      sql += ` AND SPECIFIC_SCHEMA = '${escapedSchema}'`;
+  private ensureSchema(schemasMap: Map<string, SnowflakeSchemaEntry>, name: string): SnowflakeSchemaEntry {
+    if (!schemasMap.has(name)) {
+      schemasMap.set(name, {
+        name,
+        tables: new Map(),
+        views: new Map(),
+        procedures: [],
+        functions: []
+      });
     }
+    return schemasMap.get(name)!;
+  }
 
-    sql += ' ORDER BY SPECIFIC_SCHEMA, SPECIFIC_NAME, ORDINAL_POSITION';
-    return sql;
+  private objectKey(schemaName: string, objectName: string): string {
+    return `${schemaName}\u0000${objectName}`;
+  }
+
+  private isViewType(tableType: string): boolean {
+    return tableType.toUpperCase().includes('VIEW');
   }
 
   private quoteIdentifier(identifier: string): string {

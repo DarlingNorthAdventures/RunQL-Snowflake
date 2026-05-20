@@ -91,9 +91,9 @@ function handleProviderAction(actionId: string, payload: Record<string, unknown>
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  const core = vscode.extensions.getExtension<RunQLExtensionApi>('runql.runql');
+  const core = vscode.extensions.getExtension<RunQLExtensionApi>('RunQL-VSCode-Extension.runql');
   if (!core) {
-    vscode.window.showWarningMessage('RunQL Snowflake Connector requires runql.runql.');
+    vscode.window.showWarningMessage('RunQL Snowflake Connector requires RunQL-VSCode-Extension.runql.');
     return;
   }
 

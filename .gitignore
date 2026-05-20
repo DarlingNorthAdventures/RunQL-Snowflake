@@ -1,12 +1,16 @@
 node_modules
 dist/
+out/
 .idea
 .vscode
 .DS_Store
+*.vsix
+*.log
+*.tsbuildinfo
+.vscode-test/
 RunQL/system
 
 # Test artifacts
 coverage/
-*.log
 junit.xml
 .jest-cache/

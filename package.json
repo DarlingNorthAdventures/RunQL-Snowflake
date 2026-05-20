@@ -4,7 +4,7 @@
   "description": "Optional Snowflake connector for RunQL.",
   "publisher": "runql",
   "icon": "media/icon.png",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -35,7 +35,7 @@
     "onCommand:runql.snowflake.openSetupGuide"
   ],
   "extensionDependencies": [
-    "runql.runql"
+    "RunQL-VSCode-Extension.runql"
   ],
   "main": "./dist/extension.js",
   "contributes": {

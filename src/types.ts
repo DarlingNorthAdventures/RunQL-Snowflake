@@ -66,18 +66,27 @@ export interface ColumnModel {
   comment?: string;
 }
 
+export interface ForeignKeyModel {
+  name?: string;
+  column: string;
+  foreignSchema: string;
+  foreignTable: string;
+  foreignColumn: string;
+}
+
+export interface IndexModel {
+  name: string;
+  columns: string[];
+  unique: boolean;
+}
+
 export interface TableModel {
   name: string;
   comment?: string;
   columns: ColumnModel[];
   primaryKey?: string[];
-  foreignKeys?: Array<{
-    name?: string;
-    column: string;
-    foreignSchema: string;
-    foreignTable: string;
-    foreignColumn: string;
-  }>;
+  foreignKeys?: ForeignKeyModel[];
+  indexes?: IndexModel[];
 }
 
 export type RoutineKind = 'procedure' | 'function';
@@ -104,6 +113,7 @@ export interface RoutineModel {
 export interface SchemaModel {
   name: string;
   tables: TableModel[];
+  views?: TableModel[];
   procedures?: RoutineModel[];
   functions?: RoutineModel[];
 }

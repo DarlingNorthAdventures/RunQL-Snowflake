@@ -55,10 +55,11 @@ export const snowflakeProvider: DPProviderDescriptor = {
       },
       {
         key: 'schema',
-        label: 'Schema',
+        label: 'Default Schema (Optional)',
         type: 'text',
         tab: 'connection',
         storage: 'profile',
+        description: 'Sets the Snowflake session default schema. Introspection returns all visible schemas in the selected database.',
         width: 'half'
       },
       {
