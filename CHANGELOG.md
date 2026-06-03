@@ -27,3 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 - Publish to Open VSX marketplace
+
+## [1.2.0]
+
+### Added
+- Fixed an issue with schema introspection.
