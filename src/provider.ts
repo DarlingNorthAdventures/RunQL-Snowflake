@@ -59,7 +59,7 @@ export const snowflakeProvider: DPProviderDescriptor = {
         type: 'text',
         tab: 'connection',
         storage: 'profile',
-        description: 'Sets the Snowflake session default schema. Introspection returns all visible schemas in the selected database.',
+        description: 'Sets the Snowflake session default schema. When provided, introspection is scoped to this schema.',
         width: 'half'
       },
       {

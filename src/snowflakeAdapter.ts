@@ -98,20 +98,21 @@ export class SnowflakeAdapter implements DbAdapter {
         );
       }
 
-      const [schemaRows, tableRows, columnRows, primaryKeyRows, foreignKeyRows, routineRows, parameterRows] = await Promise.all([
-        this.execute(conn, this.buildSchemasIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildTablesIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildPrimaryKeysIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildForeignKeysIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildRoutinesIntrospectionSql(targetDatabase)),
-        this.execute(conn, this.buildRoutineParametersSql(targetDatabase))
+      const targetSchema = profile.schema?.trim()
+        ? await this.getCurrentSchema(conn) ?? profile.schema.trim()
+        : undefined;
+      const [schemaRows, tableRows, columnRows, primaryKeyRows, foreignKeyRows] = await Promise.all([
+        this.execute(conn, this.buildSchemasIntrospectionSql(targetDatabase, targetSchema)),
+        this.execute(conn, this.buildTablesIntrospectionSql(targetDatabase, targetSchema)),
+        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase, targetSchema)),
+        this.execute(conn, this.buildPrimaryKeysIntrospectionSql(targetDatabase, targetSchema)),
+        this.execute(conn, this.buildForeignKeysIntrospectionSql(targetDatabase, targetSchema))
       ]);
+      const routineRows = await this.executeOptional(conn, this.buildRoutinesIntrospectionSql(targetDatabase, targetSchema));
 
       const schemasMap = new Map<string, SnowflakeSchemaEntry>();
       const tableTypeMap = new Map<string, string>();
       const tableCommentMap = new Map<string, string | undefined>();
-      const routinesBySpecificName = new Map<string, RoutineModel>();
 
       for (const row of schemaRows) {
         const schemaName = this.getRowString(row, ['SCHEMA_NAME', 'schema_name']);
@@ -227,8 +228,10 @@ export class SnowflakeAdapter implements DbAdapter {
         const schemaName = this.getRowString(row, ['ROUTINE_SCHEMA', 'routine_schema']);
         const routineName = this.getRowString(row, ['ROUTINE_NAME', 'routine_name']);
         const routineTypeRaw = this.getRowString(row, ['ROUTINE_TYPE', 'routine_type']) ?? '';
-        const specificName = this.getRowString(row, ['SPECIFIC_NAME', 'specific_name']);
         const returnType = this.getRowString(row, ['DATA_TYPE', 'data_type']);
+        const argumentSignature = this.getRowString(row, ['ARGUMENT_SIGNATURE', 'argument_signature']);
+        const language = this.getRowString(row, ['ROUTINE_LANGUAGE', 'routine_language']);
+        const comment = this.getRowString(row, ['COMMENT', 'comment']);
 
         if (!schemaName || !routineName) {
           continue;
@@ -241,51 +244,16 @@ export class SnowflakeAdapter implements DbAdapter {
           name: routineName,
           kind,
           returnType: kind === 'function' ? returnType || undefined : undefined,
-          parameters: []
+          language: language || undefined,
+          comment: comment || undefined,
+          signature: this.buildRoutineSignatureFromArgumentSignature(routineName, argumentSignature),
+          parameters: this.parseRoutineParameters(argumentSignature)
         };
 
         if (kind === 'procedure') {
           schema.procedures.push(routine);
         } else {
           schema.functions.push(routine);
-        }
-
-        const keyName = specificName || routineName;
-        routinesBySpecificName.set(this.routineSpecificKey(schemaName, keyName), routine);
-      }
-
-      for (const row of parameterRows) {
-        const schemaName = this.getRowString(row, ['SPECIFIC_SCHEMA', 'specific_schema']);
-        const specificName = this.getRowString(row, ['SPECIFIC_NAME', 'specific_name']);
-        const modeRaw = this.getRowString(row, ['PARAMETER_MODE', 'parameter_mode']);
-        const dataType = this.getRowString(row, ['DATA_TYPE', 'data_type']);
-        const ordinalPosition = this.getRowNumber(row, ['ORDINAL_POSITION', 'ordinal_position']);
-        const parameterNameRaw = this.getRowString(row, ['PARAMETER_NAME', 'parameter_name']);
-
-        if (!schemaName || !specificName) {
-          continue;
-        }
-
-        const routine = routinesBySpecificName.get(this.routineSpecificKey(schemaName, specificName));
-        if (!routine) {
-          continue;
-        }
-
-        const mode = this.normalizeParameterMode(modeRaw);
-        const position = typeof ordinalPosition === 'number' ? ordinalPosition : undefined;
-        const generatedName = position ? `arg${position}` : 'arg';
-        const parameterName = parameterNameRaw?.trim() || (mode === 'return' ? 'return_value' : generatedName);
-
-        routine.parameters = routine.parameters ?? [];
-        routine.parameters.push({
-          name: parameterName,
-          mode,
-          type: dataType || undefined,
-          position
-        });
-
-        if (!routine.returnType && mode === 'return' && dataType) {
-          routine.returnType = dataType;
         }
       }
 
@@ -339,17 +307,30 @@ export class SnowflakeAdapter implements DbAdapter {
     }
   }
 
-  private buildSchemasIntrospectionSql(databaseName: string): string {
+  private async getCurrentSchema(conn: snowflake.Connection): Promise<string | undefined> {
+    try {
+      const rows = await this.execute(conn, 'SELECT CURRENT_SCHEMA() AS CURRENT_SCHEMA');
+      if (!rows || rows.length === 0) {
+        return undefined;
+      }
+      return this.getRowString(rows[0], ['CURRENT_SCHEMA', 'current_schema']);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private buildSchemasIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT SCHEMA_NAME
       FROM ${db}.INFORMATION_SCHEMA.SCHEMATA
       WHERE SCHEMA_NAME NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ${this.buildSchemaFilter('SCHEMA_NAME', schemaName)}
       ORDER BY SCHEMA_NAME
     `;
   }
 
-  private buildTablesIntrospectionSql(databaseName: string): string {
+  private buildTablesIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT
@@ -359,11 +340,12 @@ export class SnowflakeAdapter implements DbAdapter {
         COMMENT
       FROM ${db}.INFORMATION_SCHEMA.TABLES
       WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ${this.buildSchemaFilter('TABLE_SCHEMA', schemaName)}
       ORDER BY TABLE_SCHEMA, TABLE_NAME
     `;
   }
 
-  private buildColumnsIntrospectionSql(databaseName: string): string {
+  private buildColumnsIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT
@@ -376,11 +358,12 @@ export class SnowflakeAdapter implements DbAdapter {
         COMMENT
       FROM ${db}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ${this.buildSchemaFilter('TABLE_SCHEMA', schemaName)}
       ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
     `;
   }
 
-  private buildPrimaryKeysIntrospectionSql(databaseName: string): string {
+  private buildPrimaryKeysIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT
@@ -394,11 +377,12 @@ export class SnowflakeAdapter implements DbAdapter {
        AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
       WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
         AND kcu.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+        ${this.buildSchemaFilter('kcu.TABLE_SCHEMA', schemaName)}
       ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION
     `;
   }
 
-  private buildForeignKeysIntrospectionSql(databaseName: string): string {
+  private buildForeignKeysIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT
@@ -425,38 +409,38 @@ export class SnowflakeAdapter implements DbAdapter {
        AND pk.ORDINAL_POSITION = fk.POSITION_IN_UNIQUE_CONSTRAINT
       WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
         AND fk.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+        ${this.buildSchemaFilter('fk.TABLE_SCHEMA', schemaName)}
       ORDER BY fk.TABLE_SCHEMA, fk.TABLE_NAME, tc.CONSTRAINT_NAME, fk.ORDINAL_POSITION
     `;
   }
 
-  private buildRoutinesIntrospectionSql(databaseName: string): string {
+  private buildRoutinesIntrospectionSql(databaseName: string, schemaName?: string): string {
     const db = this.quoteIdentifier(databaseName);
     return `
       SELECT
-        ROUTINE_SCHEMA,
-        ROUTINE_NAME,
-        SPECIFIC_NAME,
-        ROUTINE_TYPE,
-        DATA_TYPE
-      FROM ${db}.INFORMATION_SCHEMA.ROUTINES
-      WHERE ROUTINE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
-      ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME
-    `;
-  }
-
-  private buildRoutineParametersSql(databaseName: string): string {
-    const db = this.quoteIdentifier(databaseName);
-    return `
-      SELECT
-        SPECIFIC_SCHEMA,
-        SPECIFIC_NAME,
-        PARAMETER_NAME,
-        PARAMETER_MODE,
+        PROCEDURE_SCHEMA AS ROUTINE_SCHEMA,
+        PROCEDURE_NAME AS ROUTINE_NAME,
+        'PROCEDURE' AS ROUTINE_TYPE,
         DATA_TYPE,
-        ORDINAL_POSITION
-      FROM ${db}.INFORMATION_SCHEMA.PARAMETERS
-      WHERE SPECIFIC_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
-      ORDER BY SPECIFIC_SCHEMA, SPECIFIC_NAME, ORDINAL_POSITION
+        ARGUMENT_SIGNATURE,
+        PROCEDURE_LANGUAGE AS ROUTINE_LANGUAGE,
+        COMMENT
+      FROM ${db}.INFORMATION_SCHEMA.PROCEDURES
+      WHERE PROCEDURE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ${this.buildSchemaFilter('PROCEDURE_SCHEMA', schemaName)}
+      UNION ALL
+      SELECT
+        FUNCTION_SCHEMA AS ROUTINE_SCHEMA,
+        FUNCTION_NAME AS ROUTINE_NAME,
+        'FUNCTION' AS ROUTINE_TYPE,
+        DATA_TYPE,
+        ARGUMENT_SIGNATURE,
+        FUNCTION_LANGUAGE AS ROUTINE_LANGUAGE,
+        COMMENT
+      FROM ${db}.INFORMATION_SCHEMA.FUNCTIONS
+      WHERE FUNCTION_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
+      ${this.buildSchemaFilter('FUNCTION_SCHEMA', schemaName)}
+      ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME, ARGUMENT_SIGNATURE
     `;
   }
 
@@ -483,6 +467,14 @@ export class SnowflakeAdapter implements DbAdapter {
 
   private quoteIdentifier(identifier: string): string {
     return `"${identifier.replace(/"/g, '""')}"`;
+  }
+
+  private quoteStringLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
+  }
+
+  private buildSchemaFilter(columnName: string, schemaName: string | undefined): string {
+    return schemaName ? `AND ${columnName} = ${this.quoteStringLiteral(schemaName)}` : '';
   }
 
   private getRowString(row: Record<string, unknown>, keys: string[]): string | undefined {
@@ -513,55 +505,13 @@ export class SnowflakeAdapter implements DbAdapter {
     return undefined;
   }
 
-  private getRowNumber(row: Record<string, unknown>, keys: string[]): number | undefined {
-    for (const key of keys) {
-      const direct = row[key];
-      if (typeof direct === 'number' && Number.isFinite(direct)) {
-        return direct;
-      }
-      if (typeof direct === 'string' && direct.trim() !== '') {
-        const parsed = Number(direct);
-        if (Number.isFinite(parsed)) {
-          return parsed;
-        }
-      }
-    }
-
-    const lowerKeys = new Set(keys.map((k) => k.toLowerCase()));
-    for (const [key, value] of Object.entries(row)) {
-      if (!lowerKeys.has(key.toLowerCase())) {
-        continue;
-      }
-      if (typeof value === 'number' && Number.isFinite(value)) {
-        return value;
-      }
-      if (typeof value === 'string' && value.trim() !== '') {
-        const parsed = Number(value);
-        if (Number.isFinite(parsed)) {
-          return parsed;
-        }
-      }
-    }
-
-    return undefined;
-  }
-
-  private routineSpecificKey(schemaName: string, specificName: string): string {
-    return `${schemaName.toUpperCase()}::${specificName.toUpperCase()}`;
-  }
-
-  private normalizeParameterMode(modeRaw: string | undefined): 'in' | 'out' | 'inout' | 'variadic' | 'return' | undefined {
-    const value = (modeRaw ?? '').trim().toUpperCase();
-    if (value === 'IN') return 'in';
-    if (value === 'OUT') return 'out';
-    if (value === 'INOUT') return 'inout';
-    if (value === 'VARIADIC') return 'variadic';
-    if (value === 'RETURN') return 'return';
-    return undefined;
-  }
-
   private buildRoutineSignature(routine: RoutineModel): string {
-    const args = (routine.parameters ?? [])
+    const parameters = routine.parameters ?? [];
+    if (parameters.length === 0 && routine.signature) {
+      return routine.signature;
+    }
+
+    const args = parameters
       .filter((parameter) => parameter.mode !== 'return')
       .map((parameter) => {
         const modePrefix = parameter.mode ? `${parameter.mode.toUpperCase()} ` : '';
@@ -570,6 +520,110 @@ export class SnowflakeAdapter implements DbAdapter {
       })
       .join(', ');
     return `${routine.name}(${args})`;
+  }
+
+  private buildRoutineSignatureFromArgumentSignature(routineName: string, argumentSignature: string | undefined): string {
+    const signature = argumentSignature?.trim();
+    if (!signature) {
+      return `${routineName}()`;
+    }
+
+    return signature.startsWith('(') ? `${routineName}${signature}` : `${routineName}(${signature})`;
+  }
+
+  private parseRoutineParameters(argumentSignature: string | undefined): NonNullable<RoutineModel['parameters']> {
+    const signature = argumentSignature?.trim();
+    if (!signature) {
+      return [];
+    }
+
+    const body = signature.startsWith('(') && signature.endsWith(')')
+      ? signature.slice(1, -1).trim()
+      : signature;
+    if (!body) {
+      return [];
+    }
+
+    return this.splitTopLevelArguments(body).map((argument, index) => {
+      const parts = argument.trim().split(/\s+/);
+      const hasExplicitName = parts.length > 1 && !this.looksLikeSnowflakeType(parts[0]);
+      const name = hasExplicitName ? parts[0] : `arg${index + 1}`;
+      const type = hasExplicitName ? parts.slice(1).join(' ') : argument.trim();
+
+      return {
+        name,
+        mode: 'in',
+        type: type || undefined,
+        position: index + 1
+      };
+    });
+  }
+
+  private splitTopLevelArguments(args: string): string[] {
+    const result: string[] = [];
+    let current = '';
+    let depth = 0;
+
+    for (const char of args) {
+      if (char === '(') {
+        depth += 1;
+      } else if (char === ')' && depth > 0) {
+        depth -= 1;
+      }
+
+      if (char === ',' && depth === 0) {
+        const value = current.trim();
+        if (value) {
+          result.push(value);
+        }
+        current = '';
+        continue;
+      }
+
+      current += char;
+    }
+
+    const value = current.trim();
+    if (value) {
+      result.push(value);
+    }
+
+    return result;
+  }
+
+  private looksLikeSnowflakeType(value: string): boolean {
+    const normalized = value.replace(/\(.*/, '').toUpperCase();
+    return [
+      'ARRAY',
+      'BIGINT',
+      'BINARY',
+      'BOOLEAN',
+      'CHAR',
+      'CHARACTER',
+      'DATE',
+      'DATETIME',
+      'DEC',
+      'DECIMAL',
+      'DOUBLE',
+      'FLOAT',
+      'GEOGRAPHY',
+      'GEOMETRY',
+      'INT',
+      'INTEGER',
+      'NUMBER',
+      'NUMERIC',
+      'OBJECT',
+      'REAL',
+      'STRING',
+      'TEXT',
+      'TIME',
+      'TIMESTAMP',
+      'TIMESTAMP_LTZ',
+      'TIMESTAMP_NTZ',
+      'TIMESTAMP_TZ',
+      'VARIANT',
+      'VARCHAR'
+    ].includes(normalized);
   }
 
   private createConnection(profile: ConnectionProfile, secrets: ConnectionSecrets): snowflake.Connection {
@@ -645,6 +699,14 @@ export class SnowflakeAdapter implements DbAdapter {
         }
       });
     });
+  }
+
+  private async executeOptional(conn: snowflake.Connection, sql: string): Promise<any[]> {
+    try {
+      return await this.execute(conn, sql);
+    } catch {
+      return [];
+    }
   }
 
   private executeWithStatement(conn: snowflake.Connection, sql: string): Promise<{ rows: any[]; statement: snowflake.RowStatement }> {
