@@ -15,6 +15,7 @@ import {
 
 const CONNECTION_TIMEOUT_MS = 30000;
 const SNOWFLAKE_DOMAIN_SUFFIX = '.snowflakecomputing.com';
+const SNOWFLAKE_SHOW_RESULT_LIMIT = 10000;
 
 interface SnowflakeSchemaEntry {
   name: string;
@@ -101,14 +102,18 @@ export class SnowflakeAdapter implements DbAdapter {
       const targetSchema = profile.schema?.trim()
         ? await this.getCurrentSchema(conn) ?? profile.schema.trim()
         : undefined;
-      const [schemaRows, tableRows, columnRows, primaryKeyRows, foreignKeyRows] = await Promise.all([
+      const [schemaRows, tableRows, columnRows] = await Promise.all([
         this.execute(conn, this.buildSchemasIntrospectionSql(targetDatabase, targetSchema)),
         this.execute(conn, this.buildTablesIntrospectionSql(targetDatabase, targetSchema)),
-        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase, targetSchema)),
-        this.execute(conn, this.buildPrimaryKeysIntrospectionSql(targetDatabase, targetSchema)),
-        this.execute(conn, this.buildForeignKeysIntrospectionSql(targetDatabase, targetSchema))
+        this.execute(conn, this.buildColumnsIntrospectionSql(targetDatabase, targetSchema))
       ]);
-      const routineRows = await this.executeOptional(conn, this.buildRoutinesIntrospectionSql(targetDatabase, targetSchema));
+      const [primaryKeyRows, foreignKeyRows, routineRows] = await Promise.all([
+        this.executeOptional(conn, this.buildPrimaryKeysIntrospectionSql(targetDatabase, targetSchema), 'primary keys'),
+        this.executeOptional(conn, this.buildForeignKeysIntrospectionSql(targetDatabase, targetSchema), 'foreign keys'),
+        this.executeOptional(conn, this.buildRoutinesIntrospectionSql(targetDatabase, targetSchema), 'routines')
+      ]);
+      this.warnIfShowRowsAtLimit('primary keys', primaryKeyRows);
+      this.warnIfShowRowsAtLimit('foreign keys', foreignKeyRows);
 
       const schemasMap = new Map<string, SnowflakeSchemaEntry>();
       const tableTypeMap = new Map<string, string>();
@@ -181,10 +186,15 @@ export class SnowflakeAdapter implements DbAdapter {
         });
       }
 
-      for (const row of primaryKeyRows) {
-        const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
-        const tableName = this.getRowString(row, ['TABLE_NAME', 'table_name']);
-        const columnName = this.getRowString(row, ['COLUMN_NAME', 'column_name']);
+      const sortedPrimaryKeyRows = [...primaryKeyRows].sort((a, b) =>
+        (this.getRowString(a, ['schema_name']) || '').localeCompare(this.getRowString(b, ['schema_name']) || '')
+        || (this.getRowString(a, ['table_name']) || '').localeCompare(this.getRowString(b, ['table_name']) || '')
+        || (this.getRowNumber(a, ['key_sequence']) ?? 0) - (this.getRowNumber(b, ['key_sequence']) ?? 0)
+      );
+      for (const row of sortedPrimaryKeyRows) {
+        const schemaName = this.getRowString(row, ['schema_name', 'TABLE_SCHEMA', 'table_schema']);
+        const tableName = this.getRowString(row, ['table_name', 'TABLE_NAME']);
+        const columnName = this.getRowString(row, ['column_name', 'COLUMN_NAME']);
         if (!schemaName || !tableName || !columnName) {
           continue;
         }
@@ -197,13 +207,22 @@ export class SnowflakeAdapter implements DbAdapter {
         table.primaryKey.push(columnName);
       }
 
-      for (const row of foreignKeyRows) {
-        const schemaName = this.getRowString(row, ['TABLE_SCHEMA', 'table_schema']);
-        const tableName = this.getRowString(row, ['TABLE_NAME', 'table_name']);
-        const columnName = this.getRowString(row, ['COLUMN_NAME', 'column_name']);
-        const foreignSchema = this.getRowString(row, ['FOREIGN_SCHEMA', 'foreign_schema']);
-        const foreignTable = this.getRowString(row, ['FOREIGN_TABLE', 'foreign_table']);
-        const foreignColumn = this.getRowString(row, ['FOREIGN_COLUMN', 'foreign_column']);
+      const sortedForeignKeyRows = [...foreignKeyRows].sort((a, b) =>
+        (this.getRowString(a, ['fk_schema_name', 'fk_table_schema', 'fktable_schem', 'schema_name']) || '')
+          .localeCompare(this.getRowString(b, ['fk_schema_name', 'fk_table_schema', 'fktable_schem', 'schema_name']) || '')
+        || (this.getRowString(a, ['fk_table_name', 'fktable_name', 'table_name']) || '')
+          .localeCompare(this.getRowString(b, ['fk_table_name', 'fktable_name', 'table_name']) || '')
+        || (this.getRowString(a, ['fk_name', 'constraint_name']) || '')
+          .localeCompare(this.getRowString(b, ['fk_name', 'constraint_name']) || '')
+        || (this.getRowNumber(a, ['key_sequence']) ?? 0) - (this.getRowNumber(b, ['key_sequence']) ?? 0)
+      );
+      for (const row of sortedForeignKeyRows) {
+        const schemaName = this.getRowString(row, ['fk_schema_name', 'fk_table_schema', 'fktable_schem', 'schema_name']);
+        const tableName = this.getRowString(row, ['fk_table_name', 'fktable_name', 'table_name']);
+        const columnName = this.getRowString(row, ['fk_column_name', 'fkcolumn_name', 'column_name']);
+        const foreignSchema = this.getRowString(row, ['pk_schema_name', 'pk_table_schema', 'pktable_schem', 'foreign_schema']);
+        const foreignTable = this.getRowString(row, ['pk_table_name', 'pktable_name', 'foreign_table']);
+        const foreignColumn = this.getRowString(row, ['pk_column_name', 'pkcolumn_name', 'foreign_column']);
         if (!schemaName || !tableName || !columnName || !foreignSchema || !foreignTable || !foreignColumn) {
           continue;
         }
@@ -214,7 +233,7 @@ export class SnowflakeAdapter implements DbAdapter {
         }
 
         const foreignKey: ForeignKeyModel = {
-          name: this.getRowString(row, ['CONSTRAINT_NAME', 'constraint_name']),
+          name: this.getRowString(row, ['fk_name', 'constraint_name']),
           column: columnName,
           foreignSchema,
           foreignTable,
@@ -364,54 +383,11 @@ export class SnowflakeAdapter implements DbAdapter {
   }
 
   private buildPrimaryKeysIntrospectionSql(databaseName: string, schemaName?: string): string {
-    const db = this.quoteIdentifier(databaseName);
-    return `
-      SELECT
-        kcu.TABLE_SCHEMA,
-        kcu.TABLE_NAME,
-        kcu.COLUMN_NAME
-      FROM ${db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-        ON kcu.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
-       AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-       AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-      WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-        AND kcu.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
-        ${this.buildSchemaFilter('kcu.TABLE_SCHEMA', schemaName)}
-      ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION
-    `;
+    return `SHOW PRIMARY KEYS ${this.buildShowScope(databaseName, schemaName)}`;
   }
 
   private buildForeignKeysIntrospectionSql(databaseName: string, schemaName?: string): string {
-    const db = this.quoteIdentifier(databaseName);
-    return `
-      SELECT
-        fk.TABLE_SCHEMA,
-        fk.TABLE_NAME,
-        fk.COLUMN_NAME,
-        tc.CONSTRAINT_NAME,
-        pk.TABLE_SCHEMA AS FOREIGN_SCHEMA,
-        pk.TABLE_NAME AS FOREIGN_TABLE,
-        pk.COLUMN_NAME AS FOREIGN_COLUMN
-      FROM ${db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
-        ON fk.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
-       AND fk.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-       AND fk.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-      JOIN ${db}.INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
-        ON rc.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
-       AND rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-       AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-      JOIN ${db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk
-        ON pk.CONSTRAINT_CATALOG = rc.UNIQUE_CONSTRAINT_CATALOG
-       AND pk.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA
-       AND pk.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME
-       AND pk.ORDINAL_POSITION = fk.POSITION_IN_UNIQUE_CONSTRAINT
-      WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
-        AND fk.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'DELETED')
-        ${this.buildSchemaFilter('fk.TABLE_SCHEMA', schemaName)}
-      ORDER BY fk.TABLE_SCHEMA, fk.TABLE_NAME, tc.CONSTRAINT_NAME, fk.ORDINAL_POSITION
-    `;
+    return `SHOW IMPORTED KEYS ${this.buildShowScope(databaseName, schemaName)}`;
   }
 
   private buildRoutinesIntrospectionSql(databaseName: string, schemaName?: string): string {
@@ -469,12 +445,32 @@ export class SnowflakeAdapter implements DbAdapter {
     return `"${identifier.replace(/"/g, '""')}"`;
   }
 
+  private quoteQualifiedIdentifier(...identifiers: string[]): string {
+    return identifiers.map((identifier) => this.quoteIdentifier(identifier)).join('.');
+  }
+
   private quoteStringLiteral(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
   }
 
   private buildSchemaFilter(columnName: string, schemaName: string | undefined): string {
     return schemaName ? `AND ${columnName} = ${this.quoteStringLiteral(schemaName)}` : '';
+  }
+
+  private buildShowScope(databaseName: string, schemaName?: string): string {
+    if (schemaName) {
+      return `IN SCHEMA ${this.quoteQualifiedIdentifier(databaseName, schemaName)}`;
+    }
+    return `IN DATABASE ${this.quoteIdentifier(databaseName)}`;
+  }
+
+  private warnIfShowRowsAtLimit(operationName: string, rows: any[]): void {
+    if (rows.length >= SNOWFLAKE_SHOW_RESULT_LIMIT) {
+      console.warn(
+        `[RunQL Snowflake] Optional ${operationName} introspection returned ${rows.length} rows. ` +
+        'Snowflake SHOW metadata can be capped at 10,000 rows, so key metadata may be incomplete.'
+      );
+    }
   }
 
   private getRowString(row: Record<string, unknown>, keys: string[]): string | undefined {
@@ -499,6 +495,39 @@ export class SnowflakeAdapter implements DbAdapter {
       }
       if (value !== undefined && value !== null) {
         return String(value);
+      }
+    }
+
+    return undefined;
+  }
+
+  private getRowNumber(row: Record<string, unknown>, keys: string[]): number | undefined {
+    for (const key of keys) {
+      const direct = row[key];
+      if (typeof direct === 'number' && Number.isFinite(direct)) {
+        return direct;
+      }
+      if (typeof direct === 'string' && direct.trim() !== '') {
+        const parsed = Number(direct);
+        if (Number.isFinite(parsed)) {
+          return parsed;
+        }
+      }
+    }
+
+    const lowerKeys = new Set(keys.map((k) => k.toLowerCase()));
+    for (const [key, value] of Object.entries(row)) {
+      if (!lowerKeys.has(key.toLowerCase())) {
+        continue;
+      }
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+      }
+      if (typeof value === 'string' && value.trim() !== '') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) {
+          return parsed;
+        }
       }
     }
 
@@ -701,10 +730,12 @@ export class SnowflakeAdapter implements DbAdapter {
     });
   }
 
-  private async executeOptional(conn: snowflake.Connection, sql: string): Promise<any[]> {
+  private async executeOptional(conn: snowflake.Connection, sql: string, operationName: string): Promise<any[]> {
     try {
       return await this.execute(conn, sql);
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[RunQL Snowflake] Optional ${operationName} introspection failed: ${message}`);
       return [];
     }
   }

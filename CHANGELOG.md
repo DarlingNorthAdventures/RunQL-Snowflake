@@ -32,3 +32,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 - Fixed an issue with schema introspection.
+
+## [1.2.1]
+
+### Added
+fix: make Snowflake schema introspection use native metadata
+
+- Scope introspection to the configured schema when one is provided
+- Replace unsupported KEY_COLUMN_USAGE queries with SHOW PRIMARY KEYS / SHOW IMPORTED KEYS
+- Use Snowflake PROCEDURES and FUNCTIONS metadata instead of ROUTINES / PARAMETERS
+- Keep PK, FK, and routine metadata best-effort so table/column introspection is not blocked
+- Sort PK/FK metadata by key sequence for composite keys
+- Warn when optional metadata introspection fails or SHOW results may be truncated
