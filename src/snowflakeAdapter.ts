@@ -2,6 +2,7 @@ import * as snowflake from 'snowflake-sdk';
 import {
   ConnectionProfile,
   ConnectionSecrets,
+  CopyTableOptions,
   DbAdapter,
   ForeignKeyModel,
   NonQueryResult,
@@ -312,6 +313,108 @@ export class SnowflakeAdapter implements DbAdapter {
     } finally {
       await this.destroy(conn);
     }
+  }
+
+  // ─── Optional table-operation capabilities ────────────────────────────────
+
+  async getTableDdl(
+    profile: ConnectionProfile,
+    secrets: ConnectionSecrets,
+    schema: string | undefined,
+    table: string
+  ): Promise<string> {
+    const conn = this.createConnection(profile, secrets);
+    try {
+      await this.connect(conn);
+      const objectName = await this.buildQualifiedObjectName(conn, profile, schema, table);
+      const rows = await this.execute(
+        conn,
+        `SELECT GET_DDL('TABLE', ${this.quoteStringLiteral(objectName)}, TRUE) AS DDL`
+      );
+      const ddl = this.getRowString(rows[0] || {}, ['DDL', 'ddl']);
+      if (!ddl) {
+        throw new Error(`Snowflake returned no DDL for ${objectName}.`);
+      }
+      return ddl;
+    } finally {
+      await this.destroy(conn);
+    }
+  }
+
+  async dumpTableStructure(
+    profile: ConnectionProfile,
+    secrets: ConnectionSecrets,
+    schema: string | undefined,
+    table: string
+  ): Promise<string> {
+    return this.getTableDdl(profile, secrets, schema, table);
+  }
+
+  async truncateTable(
+    profile: ConnectionProfile,
+    secrets: ConnectionSecrets,
+    schema: string | undefined,
+    table: string
+  ): Promise<void> {
+    const conn = this.createConnection(profile, secrets);
+    try {
+      await this.connect(conn);
+      const objectName = await this.buildQualifiedObjectName(conn, profile, schema, table);
+      await this.execute(conn, `TRUNCATE TABLE ${objectName}`);
+    } finally {
+      await this.destroy(conn);
+    }
+  }
+
+  async copyTable(
+    profile: ConnectionProfile,
+    secrets: ConnectionSecrets,
+    sourceSchema: string | undefined,
+    sourceTable: string,
+    options: CopyTableOptions
+  ): Promise<void> {
+    const conn = this.createConnection(profile, secrets);
+    try {
+      await this.connect(conn);
+      const src = await this.buildQualifiedObjectName(conn, profile, sourceSchema, sourceTable);
+      const dst = await this.buildQualifiedObjectName(
+        conn,
+        profile,
+        options.destSchema ?? sourceSchema,
+        options.destTable
+      );
+      // CLONE is zero-copy and preserves constraints. LIKE is structure-only
+      // (columns/constraints without data). Both are Snowflake-native.
+      const sql = options.withData
+        ? `CREATE TABLE ${dst} CLONE ${src}`
+        : `CREATE TABLE ${dst} LIKE ${src}`;
+      await this.execute(conn, sql);
+    } finally {
+      await this.destroy(conn);
+    }
+  }
+
+  private async buildQualifiedObjectName(
+    conn: snowflake.Connection,
+    profile: ConnectionProfile,
+    schemaName: string | undefined,
+    objectName: string
+  ): Promise<string> {
+    // Snowflake introspection may already qualify schema as "DATABASE.SCHEMA".
+    if (schemaName && schemaName.includes('.')) {
+      const parts = schemaName.split('.').map((p) => p.trim()).filter(Boolean);
+      if (parts.length >= 2) {
+        return this.quoteQualifiedIdentifier(parts[0], parts.slice(1).join('.'), objectName);
+      }
+    }
+    const database = profile.database?.trim() || (await this.getCurrentDatabase(conn));
+    if (database && schemaName) {
+      return this.quoteQualifiedIdentifier(database, schemaName, objectName);
+    }
+    if (schemaName) {
+      return this.quoteQualifiedIdentifier(schemaName, objectName);
+    }
+    return this.quoteIdentifier(objectName);
   }
 
   private async getCurrentDatabase(conn: snowflake.Connection): Promise<string | undefined> {

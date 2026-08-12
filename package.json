@@ -4,7 +4,7 @@
   "description": "Optional Snowflake connector for RunQL.",
   "publisher": "runql",
   "icon": "media/icon.png",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "license": "MIT",
   "repository": {
     "type": "git",

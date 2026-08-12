@@ -44,3 +44,19 @@ fix: make Snowflake schema introspection use native metadata
 - Keep PK, FK, and routine metadata best-effort so table/column introspection is not blocked
 - Sort PK/FK metadata by key sequence for composite keys
 - Warn when optional metadata introspection fails or SHOW results may be truncated
+
+## [1.3.0]
+
+### Changes
+
+#### More Table Actions in RunQL Explorer
+
+Right-click any table in RunQL Explorer to:
+
+- Copy the table name
+- Edit the table
+- View table DDL
+- Generate SELECT, INSERT, UPDATE, and DELETE templates
+- Dump table structure
+- Generate mock data
+- Copy, drop, or truncate a table

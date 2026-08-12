@@ -127,12 +127,26 @@ export interface SchemaIntrospection {
   schemas: SchemaModel[];
 }
 
+export interface CopyTableOptions {
+  destSchema?: string;
+  destTable: string;
+  withData: boolean;
+}
+
 export interface DbAdapter {
   readonly dialect: string;
   testConnection(profile: ConnectionProfile, secrets: ConnectionSecrets): Promise<void>;
   runQuery(profile: ConnectionProfile, secrets: ConnectionSecrets, sql: string, options: QueryRunOptions): Promise<QueryResult>;
   executeNonQuery(profile: ConnectionProfile, secrets: ConnectionSecrets, sql: string): Promise<NonQueryResult>;
   introspectSchema(profile: ConnectionProfile, secrets: ConnectionSecrets): Promise<SchemaIntrospection>;
+
+  // Optional table-operation capabilities. Client falls back to generic SQL
+  // when these are absent. See table-item-context-menu.md.
+  getTableDdl?(profile: ConnectionProfile, secrets: ConnectionSecrets, schema: string | undefined, table: string): Promise<string>;
+  dumpTableStructure?(profile: ConnectionProfile, secrets: ConnectionSecrets, schema: string | undefined, table: string): Promise<string>;
+  dumpTableStructureAndData?(profile: ConnectionProfile, secrets: ConnectionSecrets, schema: string | undefined, table: string): Promise<string>;
+  copyTable?(profile: ConnectionProfile, secrets: ConnectionSecrets, sourceSchema: string | undefined, sourceTable: string, options: CopyTableOptions): Promise<void>;
+  truncateTable?(profile: ConnectionProfile, secrets: ConnectionSecrets, schema: string | undefined, table: string): Promise<void>;
 }
 
 export interface DPProviderDescriptor {
